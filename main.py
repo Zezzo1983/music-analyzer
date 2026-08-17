@@ -120,3 +120,28 @@ async def process_and_export(file: UploadFile):
         headers={"Content-Disposition": 'attachment; filename="dischi_analizzati_finale.xlsx"'},
     )
 
+import os
+from fastapi import HTTPException
+
+# -----------------------------
+# Endpoint: lista dei file intermedi
+# -----------------------------
+@app.get("/list-intermedi")
+async def list_intermedi():
+    files = [f for f in os.listdir(".") if f.startswith("intermedio_") and f.endswith(".xlsx")]
+    return {"files": files}
+
+# -----------------------------
+# Endpoint: download di un file intermedio
+# -----------------------------
+@app.get("/download-intermedio")
+async def download_intermedio(file: str):
+    if not os.path.exists(file):
+        raise HTTPException(status_code=404, detail="File non trovato")
+
+    output = open(file, "rb")
+    return StreamingResponse(
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{file}"'},
+    )
