@@ -115,8 +115,8 @@ async def process_and_export(file: UploadFile):
     output.seek(0)
 
     return StreamingResponse(
-    output,
-    media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    headers={"Content-Disposition": 'attachment; filename="dischi_analizzati_finale.xlsx"'},
-)
+        output,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": 'attachment; filename="dischi_analizzati_finale.xlsx"'},
+    )
 
