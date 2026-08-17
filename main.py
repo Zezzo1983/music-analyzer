@@ -42,7 +42,7 @@ PREZZOMIN: [Prezzo in Euro]
 PREZZOMAX: [Prezzo in Euro]
 """
 
-    url = "https://api-inference.huggingface.co/models/meta-llama/Meta-Llama-3-8B-Instruct"
+    url = "https://api.huggingface.co/models/meta-llama/Meta-Llama-3-8B-Instruct"
     headers = {
         "Authorization": f"Bearer {os.environ['HF_TOKEN']}",
         "Content-Type": "application/json"
