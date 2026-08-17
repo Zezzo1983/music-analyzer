@@ -1,7 +1,10 @@
 from fastapi import FastAPI, UploadFile
+from fastapi.responses import StreamingResponse
 import pandas as pd
 import requests
 import os
+import io
+import math
 
 app = FastAPI()
 
@@ -47,22 +50,35 @@ PREZZOMAX: [Prezzo in Euro]
     return r.json()[0]["generated_text"]
 
 # -----------------------------
-# Endpoint principale
+# Endpoint principale con export finale + export intermedi
 # -----------------------------
 
-@app.post("/process")
-async def process_excel(file: UploadFile):
+@app.post("/process-and-export")
+async def process_and_export(file: UploadFile):
     df = pd.read_excel(file.file)
 
+    # Colonne AI
     colonne_ai = [
         "Rarita", "Genere_Musicale", "Cluster_Assegnato",
         "Nota_Mercato_Critica", "Presenza_Versioni_Multiple",
         "Prezzo_Min_Assoluto", "Prezzo_Max_Assoluto"
     ]
     for col in colonne_ai:
-        df[col] = ""
+        if col not in df.columns:
+            df[col] = ""
 
-    for idx, row in df.iterrows():
+    totale = len(df)
+    step = max(1, totale // 20)  # 5% del totale
+
+    # Trova la prima riga NON lavorata
+    start_index = df[df["Cluster_Assegnato"].isna() | (df["Cluster_Assegnato"] == "")].index.min()
+    if math.isnan(start_index):
+        start_index = 0
+
+    # Elaborazione
+    for idx in range(int(start_index), totale):
+        row = df.loc[idx]
+
         titolo = str(row["Titolo"])
         autore = str(row["Autore"])
         stato = str(row["Stato"])
@@ -84,8 +100,20 @@ async def process_excel(file: UploadFile):
         except Exception as e:
             df.at[idx, "Cluster_Assegnato"] = f"Errore AI: {e}"
 
-    return {
-        "righe_processate": len(df),
-        "anteprima": df.head(10).to_dict(orient="records")
-    }
+        # Export intermedi ogni 5%
+        if idx % step == 0 and idx > start_index:
+            buffer = io.BytesIO()
+            df.to_excel(buffer, index=False)
+            buffer.seek(0)
+            # Salva file intermedio
+            with open(f"intermedio_{idx}.xlsx", "wb") as f:
+                f.write(buffer.read())
 
+    # Export finale
+    output = io.BytesIO()
+    df.to_excel(output, index=False)
+    output.seek(0)
+
+    return StreamingResponse(
+        output,
+        media_type="application
