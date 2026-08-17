@@ -114,7 +114,7 @@ async def process_and_export(file: UploadFile):
     df.to_excel(output, index=False)
     output.seek(0)
 
-return StreamingResponse(
+    return StreamingResponse(
     output,
     media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     headers={"Content-Disposition": 'attachment; filename="dischi_analizzati_finale.xlsx"'},
