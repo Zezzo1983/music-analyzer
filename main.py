@@ -1,223 +1,232 @@
-from fastapi import FastAPI, UploadFile, HTTPException
-from fastapi.responses import StreamingResponse
+import os
+import json
+import threading
+import time
 import pandas as pd
 import requests
-import os
-import io
-import math
-import threading
-import json
-import time
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import FileResponse
 
 app = FastAPI()
 
-# -----------------------------
-# Configurazione job asincrono
-# -----------------------------
-JOB_STATE_FILE = "job_state.json"
-JOB_RUNNING_FLAG = "job_running.flag"
+# ---------------------------
+# FUNZIONE AI CORRETTA
+# ---------------------------
+def call_ai_service(titolo, autore):
+    try:
+        HF_TOKEN = os.environ.get("HF_TOKEN")
+        if HF_TOKEN is None:
+            return {"errore": "HF_TOKEN mancante nel container"}
 
+        url = "https://api-inference.huggingface.co/models/mistralai/Mixtral-8x7B-Instruct-v0.1"
 
-# -----------------------------
-# Funzione AI (HuggingFace Llama 3)
-# -----------------------------
-def ai_esperto_mondiale(titolo, autore, stato, dettagli, supporto):
-    prompt = f"""
-Sei un esperto mondiale di collezionismo di dischi e CD musicali.
-Analizza questo articolo:
-- Titolo: {titolo}
-- Autore/Artista: {autore}
-- Stato d'usura: {stato}
-- Dettagli aggiuntivi: {dettagli}
-- Supporto/Formato: {supporto}
+        headers = {
+            "Authorization": f"Bearer {HF_TOKEN}",
+            "Content-Type": "application/json"
+        }
 
-Genera un'analisi dettagliata rispondendo RIGOROSAMENTE compilando questo schema, senza testi discorsivi:
+        prompt = f"""
+Sei un esperto mondiale di musica, rarità, collezionismo e mercato dei dischi.
+Analizza questo disco e restituisci SOLO un JSON con queste chiavi:
 
-RARITA: [Bassa, Media, Alta, Molto Alta]
-GENERE: [Es. Rock, Jazz, Pop, Metal, Hip-Hop]
-CLUSTER: [Gemma Storica, Mainstream Economico, Box di Valore, Oggetto di Nicchia]
-NOTA: [Una frase sul perché ha valore o se ci sono varianti note]
-MULTIVERSIONI: [SI/NO]
-PREZZOMIN: [Prezzo in Euro]
-PREZZOMAX: [Prezzo in Euro]
+- rarita
+- genere
+- cluster
+- prezzo_min
+- prezzo_max
+
+Disco:
+Titolo: {titolo}
+Autore: {autore}
+
+Rispondi SOLO con JSON valido.
 """
 
-    url = "https://api.huggingface.co/models/meta-llama/Meta-Llama-3-8B-Instruct"
-    headers = {
-        "Authorization": f"Bearer {os.environ['HF_TOKEN']}",
-        "Content-Type": "application/json"
-    }
+        payload = {"inputs": prompt}
 
-    payload = {
-        "inputs": prompt,
-        "parameters": {"temperature": 0.0}
-    }
+        response = requests.post(url, headers=headers, json=payload, timeout=60)
 
-    r = requests.post(url, json=payload, headers=headers)
-    r.raise_for_status()
+        if response.status_code != 200:
+            return {"errore": f"Errore HuggingFace: {response.status_code} - {response.text}"}
 
-    return r.json()[0]["generated_text"]
+        data = response.json()
+
+        if isinstance(data, list) and "generated_text" in data[0]:
+            raw = data[0]["generated_text"]
+        else:
+            return {"errore": f"Formato risposta inatteso: {data}"}
+
+        try:
+            parsed = json.loads(raw)
+            return parsed
+        except Exception as e:
+            return {"errore": f"JSON non valido: {e} - RAW: {raw}"}
+
+    except Exception as e:
+        return {"errore": f"Errore AI interno: {e}"}
 
 
-# -----------------------------
-# Gestione stato job
-# -----------------------------
-def save_job_state(state):
-    with open(JOB_STATE_FILE, "w") as f:
-        json.dump(state, f)
+# ---------------------------
+# JOB ASINCRONO
+# ---------------------------
+def process_file_async(df):
+    total = len(df)
+    progress_step = max(1, int(total * 0.025))  # 2.5%
+
+    next_intermediate = progress_step
+    current_index = 0
+
+    # Crea flag job
+    with open("job_running.flag", "w") as f:
+        f.write("1")
+
+    while current_index < total:
+        # Se il job è stato fermato
+        if not os.path.exists("job_running.flag"):
+            break
+
+        row = df.iloc[current_index]
+        titolo = str(row["Titolo"])
+        autore = str(row["Autore"])
+
+        risultato = call_ai_service(titolo, autore)
+
+        if "errore" in risultato:
+            df.at[current_index, "Cluster_Assegnato"] = risultato["errore"]
+        else:
+            df.at[current_index, "Rarita"] = risultato.get("rarita")
+            df.at[current_index, "Genere"] = risultato.get("genere")
+            df.at[current_index, "Cluster_Assegnato"] = risultato.get("cluster")
+            df.at[current_index, "PrezzoMin"] = risultato.get("prezzo_min")
+            df.at[current_index, "PrezzoMax"] = risultato.get("prezzo_max")
+
+        # Aggiorna stato
+        with open("job_state.json", "w") as f:
+            json.dump({
+                "current": current_index + 1,
+                "total": total,
+                "percent": round((current_index + 1) / total * 100, 2),
+                "running": True
+            }, f)
+
+        # Salva intermedi ogni 2.5%
+        if current_index + 1 >= next_intermediate:
+            filename = f"intermedio_{current_index+1}.xlsx"
+            df.to_excel(filename, index=False)
+            next_intermediate += progress_step
+
+        current_index += 1
+        time.sleep(0.1)
+
+    # Job completato o fermato
+    df.to_excel("finale.xlsx", index=False)
+
+    with open("job_state.json", "w") as f:
+        json.dump({
+            "current": min(current_index, total),
+            "total": total,
+            "percent": 100 if current_index >= total else round(current_index / total * 100, 2),
+            "running": False
+        }, f)
 
 
-def load_job_state():
-    if not os.path.exists(JOB_STATE_FILE):
-        return {"status": "idle", "progress": 0, "current_row": 0, "total": 0}
-    with open(JOB_STATE_FILE, "r") as f:
+# ---------------------------
+# ENDPOINT FASTAPI
+# ---------------------------
+
+@app.post("/start-job")
+async def start_job(file: UploadFile = File(...)):
+    # Pulisci eventuali file vecchi
+    for f in os.listdir("."):
+        if f.startswith("intermedio_") or f in ["finale.xlsx", "job_state.json", "input.xlsx", "job_running.flag"]:
+            try:
+                os.remove(f)
+            except:
+                pass
+
+    # Salva input
+    with open("input.xlsx", "wb") as f:
+        f.write(await file.read())
+
+    df = pd.read_excel("input.xlsx")
+
+    # Aggiungi colonne se mancano
+    for col in ["Rarita", "Genere", "Cluster_Assegnato", "PrezzoMin", "PrezzoMax"]:
+        if col not in df.columns:
+            df[col] = None
+
+    # Avvia thread
+    thread = threading.Thread(target=process_file_async, args=(df,))
+    thread.start()
+
+    return {"status": "Job avviato"}
+
+
+@app.get("/job-status")
+def job_status():
+    if not os.path.exists("job_state.json"):
+        return {"running": False, "percent": 0}
+    with open("job_state.json", "r") as f:
         return json.load(f)
 
 
-# -----------------------------
-# JOB ASINCRONO
-# -----------------------------
-def background_job(filename):
-    df = pd.read_excel(filename)
+@app.get("/list-intermedi")
+def list_intermedi():
+    files = [f for f in os.listdir(".") if f.startswith("intermedio_")]
+    return {"intermedi": files}
 
-    # Colonne AI
-    colonne_ai = [
-        "Rarita", "Genere_Musicale", "Cluster_Assegnato",
-        "Nota_Mercato_Critica", "Presenza_Versioni_Multiple",
-        "Prezzo_Min_Assoluto", "Prezzo_Max_Assoluto"
-    ]
-    for col in colonne_ai:
-        if col not in df.columns:
-            df[col] = ""
 
-    totale = len(df)
-    step = max(1, totale // 20)  # 5%
+@app.get("/download-intermedio")
+def download_intermedio(name: str):
+    return FileResponse(name)
 
-    # Stato iniziale
-    state = {
-        "status": "running",
-        "progress": 0,
-        "current_row": 0,
-        "total": totale
-    }
-    save_job_state(state)
 
-    # Trova prima riga non lavorata
-    start_index = df[df["Cluster_Assegnato"].isna() | (df["Cluster_Assegnato"] == "")].index.min()
-    if math.isnan(start_index):
-        start_index = 0
+@app.get("/download-finale")
+def download_finale():
+    return FileResponse("finale.xlsx")
 
-    # Elaborazione
-    for idx in range(int(start_index), totale):
-        row = df.loc[idx]
 
-        titolo = str(row["Titolo"])
-        autore = str(row["Autore"])
-        stato = str(row["Stato"])
-        dettagli = str(row.get("Dettagli", ""))
-        supporto = str(row["Supporto"])
+# ---------------------------
+# STOP JOB
+# ---------------------------
+@app.post("/stop-job")
+def stop_job(clean_intermedi: bool = False):
+    """
+    Ferma il job asincrono e, opzionalmente, cancella tutti i file intermedi.
+    """
 
+    # Aggiorna stato
+    if os.path.exists("job_state.json"):
         try:
-            risposta = ai_esperto_mondiale(titolo, autore, stato, dettagli, supporto)
+            with open("job_state.json", "r") as f:
+                state = json.load(f)
+        except:
+            state = {"current": 0, "total": 0, "percent": 0}
 
-            for linea in risposta.split("\n"):
-                if "RARITA:" in linea: df.at[idx, "Rarita"] = linea.split("RARITA:")[1].strip()
-                if "GENERE:" in linea: df.at[idx, "Genere_Musicale"] = linea.split("GENERE:")[1].strip()
-                if "CLUSTER:" in linea: df.at[idx, "Cluster_Assegnato"] = linea.split("CLUSTER:")[1].strip()
-                if "NOTA:" in linea: df.at[idx, "Nota_Mercato_Critica"] = linea.split("NOTA:")[1].strip()
-                if "MULTIVERSIONI:" in linea: df.at[idx, "Presenza_Versioni_Multiple"] = linea.split("MULTIVERSIONI:")[1].strip()
-                if "PREZZOMIN:" in linea: df.at[idx, "Prezzo_Min_Assoluto"] = linea.split("PREZZOMIN:")[1].strip()
-                if "PREZZOMAX:" in linea: df.at[idx, "Prezzo_Max_Assoluto"] = linea.split("PREZZOMAX:")[1].strip()
+        state["running"] = False
 
-        except Exception as e:
-            df.at[idx, "Cluster_Assegnato"] = f"Errore AI: {e}"
-
-        # Aggiorna stato
-        state["current_row"] = idx
-        state["progress"] = round((idx / totale) * 100, 2)
-        save_job_state(state)
-
-        # Export intermedi
-        if idx % step == 0 and idx > start_index:
-            df.to_excel(f"intermedio_{idx}.xlsx", index=False)
-
-        time.sleep(0.1)  # evita overload API
-
-    # Export finale
-    df.to_excel("finale.xlsx", index=False)
-
-    # Stato finale
-    state["status"] = "completed"
-    save_job_state(state)
+        with open("job_state.json", "w") as f:
+            json.dump(state, f)
 
     # Rimuovi flag
-    if os.path.exists(JOB_RUNNING_FLAG):
-        os.remove(JOB_RUNNING_FLAG)
+    if os.path.exists("job_running.flag"):
+        os.remove("job_running.flag")
+
+    # Cancella intermedi se richiesto
+    if clean_intermedi:
+        for f in os.listdir("."):
+            if f.startswith("intermedio_"):
+                try:
+                    os.remove(f)
+                except:
+                    pass
+
+    return {
+        "status": "Job fermato",
+        "intermedi_cancellati": clean_intermedi
+    }
 
 
-# -----------------------------
-# Endpoint: avvia job
-# -----------------------------
-@app.post("/start-job")
-async def start_job(file: UploadFile):
-    filename = "input.xlsx"
-    with open(filename, "wb") as f:
-        f.write(await file.read())
-
-    with open(JOB_RUNNING_FLAG, "w") as f:
-        f.write("running")
-
-    thread = threading.Thread(target=background_job, args=(filename,))
-    thread.start()
-
-    return {"message": "Job avviato", "file": filename}
-
-
-# -----------------------------
-# Endpoint: stato job
-# -----------------------------
-@app.get("/job-status")
-async def job_status():
-    return load_job_state()
-
-
-# -----------------------------
-# Endpoint: download finale
-# -----------------------------
-@app.get("/download-final")
-async def download_final():
-    if not os.path.exists("finale.xlsx"):
-        raise HTTPException(status_code=404, detail="File finale non trovato")
-
-    output = open("finale.xlsx", "rb")
-    return StreamingResponse(
-        output,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": 'attachment; filename="finale.xlsx"'},
-    )
-
-
-# -----------------------------
-# Endpoint: lista intermedi
-# -----------------------------
-@app.get("/list-intermedi")
-async def list_intermedi():
-    files = [f for f in os.listdir(".") if f.startswith("intermedio_") and f.endswith(".xlsx")]
-    return {"files": files}
-
-
-# -----------------------------
-# Endpoint: download intermedi
-# -----------------------------
-@app.get("/download-intermedio")
-async def download_intermedio(file: str):
-    if not os.path.exists(file):
-        raise HTTPException(status_code=404, detail="File non trovato")
-
-    output = open(file, "rb")
-    return StreamingResponse(
-        output,
-        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": f'attachment; filename="{file}"'},
-    )
-
+@app.get("/")
+def home():
+    return {"status": "ok", "message": "music-analyzer attivo"}
