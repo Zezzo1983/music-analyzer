@@ -1,17 +1,26 @@
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI, UploadFile, HTTPException
 from fastapi.responses import StreamingResponse
 import pandas as pd
 import requests
 import os
 import io
 import math
+import threading
+import json
+import time
 
 app = FastAPI()
 
 # -----------------------------
+# Configurazione job asincrono
+# -----------------------------
+JOB_STATE_FILE = "job_state.json"
+JOB_RUNNING_FLAG = "job_running.flag"
+
+
+# -----------------------------
 # Funzione AI (HuggingFace Llama 3)
 # -----------------------------
-
 def ai_esperto_mondiale(titolo, autore, stato, dettagli, supporto):
     prompt = f"""
 Sei un esperto mondiale di collezionismo di dischi e CD musicali.
@@ -49,13 +58,27 @@ PREZZOMAX: [Prezzo in Euro]
 
     return r.json()[0]["generated_text"]
 
-# -----------------------------
-# Endpoint principale con export finale + export intermedi
-# -----------------------------
 
-@app.post("/process-and-export")
-async def process_and_export(file: UploadFile):
-    df = pd.read_excel(file.file)
+# -----------------------------
+# Gestione stato job
+# -----------------------------
+def save_job_state(state):
+    with open(JOB_STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+
+def load_job_state():
+    if not os.path.exists(JOB_STATE_FILE):
+        return {"status": "idle", "progress": 0, "current_row": 0, "total": 0}
+    with open(JOB_STATE_FILE, "r") as f:
+        return json.load(f)
+
+
+# -----------------------------
+# JOB ASINCRONO
+# -----------------------------
+def background_job(filename):
+    df = pd.read_excel(filename)
 
     # Colonne AI
     colonne_ai = [
@@ -68,9 +91,18 @@ async def process_and_export(file: UploadFile):
             df[col] = ""
 
     totale = len(df)
-    step = max(1, totale // 20)  # 5% del totale
+    step = max(1, totale // 20)  # 5%
 
-    # Trova la prima riga NON lavorata
+    # Stato iniziale
+    state = {
+        "status": "running",
+        "progress": 0,
+        "current_row": 0,
+        "total": totale
+    }
+    save_job_state(state)
+
+    # Trova prima riga non lavorata
     start_index = df[df["Cluster_Assegnato"].isna() | (df["Cluster_Assegnato"] == "")].index.min()
     if math.isnan(start_index):
         start_index = 0
@@ -100,39 +132,82 @@ async def process_and_export(file: UploadFile):
         except Exception as e:
             df.at[idx, "Cluster_Assegnato"] = f"Errore AI: {e}"
 
-        # Export intermedi ogni 5%
+        # Aggiorna stato
+        state["current_row"] = idx
+        state["progress"] = round((idx / totale) * 100, 2)
+        save_job_state(state)
+
+        # Export intermedi
         if idx % step == 0 and idx > start_index:
-            buffer = io.BytesIO()
-            df.to_excel(buffer, index=False)
-            buffer.seek(0)
-            # Salva file intermedio
-            with open(f"intermedio_{idx}.xlsx", "wb") as f:
-                f.write(buffer.read())
+            df.to_excel(f"intermedio_{idx}.xlsx", index=False)
+
+        time.sleep(0.1)  # evita overload API
 
     # Export finale
-    output = io.BytesIO()
-    df.to_excel(output, index=False)
-    output.seek(0)
+    df.to_excel("finale.xlsx", index=False)
 
+    # Stato finale
+    state["status"] = "completed"
+    save_job_state(state)
+
+    # Rimuovi flag
+    if os.path.exists(JOB_RUNNING_FLAG):
+        os.remove(JOB_RUNNING_FLAG)
+
+
+# -----------------------------
+# Endpoint: avvia job
+# -----------------------------
+@app.post("/start-job")
+async def start_job(file: UploadFile):
+    filename = "input.xlsx"
+    with open(filename, "wb") as f:
+        f.write(await file.read())
+
+    with open(JOB_RUNNING_FLAG, "w") as f:
+        f.write("running")
+
+    thread = threading.Thread(target=background_job, args=(filename,))
+    thread.start()
+
+    return {"message": "Job avviato", "file": filename}
+
+
+# -----------------------------
+# Endpoint: stato job
+# -----------------------------
+@app.get("/job-status")
+async def job_status():
+    return load_job_state()
+
+
+# -----------------------------
+# Endpoint: download finale
+# -----------------------------
+@app.get("/download-final")
+async def download_final():
+    if not os.path.exists("finale.xlsx"):
+        raise HTTPException(status_code=404, detail="File finale non trovato")
+
+    output = open("finale.xlsx", "rb")
     return StreamingResponse(
         output,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        headers={"Content-Disposition": 'attachment; filename="dischi_analizzati_finale.xlsx"'},
+        headers={"Content-Disposition": 'attachment; filename="finale.xlsx"'},
     )
 
-import os
-from fastapi import HTTPException
 
 # -----------------------------
-# Endpoint: lista dei file intermedi
+# Endpoint: lista intermedi
 # -----------------------------
 @app.get("/list-intermedi")
 async def list_intermedi():
     files = [f for f in os.listdir(".") if f.startswith("intermedio_") and f.endswith(".xlsx")]
     return {"files": files}
 
+
 # -----------------------------
-# Endpoint: download di un file intermedio
+# Endpoint: download intermedi
 # -----------------------------
 @app.get("/download-intermedio")
 async def download_intermedio(file: str):
@@ -145,3 +220,4 @@ async def download_intermedio(file: str):
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={"Content-Disposition": f'attachment; filename="{file}"'},
     )
+
