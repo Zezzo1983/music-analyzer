@@ -10,13 +10,20 @@ from fastapi.responses import FileResponse
 app = FastAPI()
 
 # ---------------------------
-# FUNZIONE AI CORRETTA
+# FUNZIONE AI CORRETTA + RETRY HF_TOKEN
 # ---------------------------
 def call_ai_service(titolo, autore):
     try:
-        HF_TOKEN = os.environ.get("HF_TOKEN")
+        # Retry automatico per HF_TOKEN
+        HF_TOKEN = None
+        for _ in range(5):
+            HF_TOKEN = os.environ.get("HF_TOKEN")
+            if HF_TOKEN:
+                break
+            time.sleep(1)
+
         if HF_TOKEN is None:
-            return {"errore": "HF_TOKEN mancante nel container"}
+            return {"errore": "HF_TOKEN non disponibile nel container dopo 5 tentativi"}
 
         url = "https://api-inference.huggingface.co/models/mistralai/Mixtral-8x7B-Instruct-v0.1"
 
@@ -76,12 +83,10 @@ def process_file_async(df):
     next_intermediate = progress_step
     current_index = 0
 
-    # Crea flag job
     with open("job_running.flag", "w") as f:
         f.write("1")
 
     while current_index < total:
-        # Se il job è stato fermato
         if not os.path.exists("job_running.flag"):
             break
 
@@ -100,7 +105,6 @@ def process_file_async(df):
             df.at[current_index, "PrezzoMin"] = risultato.get("prezzo_min")
             df.at[current_index, "PrezzoMax"] = risultato.get("prezzo_max")
 
-        # Aggiorna stato
         with open("job_state.json", "w") as f:
             json.dump({
                 "current": current_index + 1,
@@ -109,7 +113,6 @@ def process_file_async(df):
                 "running": True
             }, f)
 
-        # Salva intermedi ogni 2.5%
         if current_index + 1 >= next_intermediate:
             filename = f"intermedio_{current_index+1}.xlsx"
             df.to_excel(filename, index=False)
@@ -118,7 +121,6 @@ def process_file_async(df):
         current_index += 1
         time.sleep(0.1)
 
-    # Job completato o fermato
     df.to_excel("finale.xlsx", index=False)
 
     with open("job_state.json", "w") as f:
@@ -136,7 +138,6 @@ def process_file_async(df):
 
 @app.post("/start-job")
 async def start_job(file: UploadFile = File(...)):
-    # Pulisci eventuali file vecchi
     for f in os.listdir("."):
         if f.startswith("intermedio_") or f in ["finale.xlsx", "job_state.json", "input.xlsx", "job_running.flag"]:
             try:
@@ -144,18 +145,15 @@ async def start_job(file: UploadFile = File(...)):
             except:
                 pass
 
-    # Salva input
     with open("input.xlsx", "wb") as f:
         f.write(await file.read())
 
     df = pd.read_excel("input.xlsx")
 
-    # Aggiungi colonne se mancano
     for col in ["Rarita", "Genere", "Cluster_Assegnato", "PrezzoMin", "PrezzoMax"]:
         if col not in df.columns:
             df[col] = None
 
-    # Avvia thread
     thread = threading.Thread(target=process_file_async, args=(df,))
     thread.start()
 
@@ -178,12 +176,18 @@ def list_intermedi():
 
 @app.get("/download-intermedio")
 def download_intermedio(name: str):
-    return FileResponse(name)
+    return FileResponse(
+        name,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 
 @app.get("/download-finale")
 def download_finale():
-    return FileResponse("finale.xlsx")
+    return FileResponse(
+        "finale.xlsx",
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 
 # ---------------------------
@@ -191,11 +195,6 @@ def download_finale():
 # ---------------------------
 @app.post("/stop-job")
 def stop_job(clean_intermedi: bool = False):
-    """
-    Ferma il job asincrono e, opzionalmente, cancella tutti i file intermedi.
-    """
-
-    # Aggiorna stato
     if os.path.exists("job_state.json"):
         try:
             with open("job_state.json", "r") as f:
@@ -208,11 +207,9 @@ def stop_job(clean_intermedi: bool = False):
         with open("job_state.json", "w") as f:
             json.dump(state, f)
 
-    # Rimuovi flag
     if os.path.exists("job_running.flag"):
         os.remove("job_running.flag")
 
-    # Cancella intermedi se richiesto
     if clean_intermedi:
         for f in os.listdir("."):
             if f.startswith("intermedio_"):
@@ -226,6 +223,10 @@ def stop_job(clean_intermedi: bool = False):
         "intermedi_cancellati": clean_intermedi
     }
 
+
+@app.get("/")
+def home():
+    return {"status": "ok", "message": "music-analyzer attivo"}
 
 @app.get("/")
 def home():
