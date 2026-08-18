@@ -231,3 +231,7 @@ def home():
 @app.get("/")
 def home():
     return {"status": "ok", "message": "music-analyzer attivo"}
+
+@app.get("/check-env")
+def check_env():
+    return {"HF_TOKEN": os.environ.get("HF_TOKEN")}
