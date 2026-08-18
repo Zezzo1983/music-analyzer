@@ -10,20 +10,15 @@ from fastapi.responses import FileResponse
 app = FastAPI()
 
 # ---------------------------
-# FUNZIONE AI CORRETTA + RETRY HF_TOKEN
+# FUNZIONE AI CORRETTA
 # ---------------------------
 def call_ai_service(titolo, autore):
     try:
-        # Retry automatico per HF_TOKEN
-        HF_TOKEN = None
-        for _ in range(5):
-            HF_TOKEN = os.environ.get("HF_TOKEN")
-            if HF_TOKEN:
-                break
-            time.sleep(1)
-
-        if HF_TOKEN is None:
-            return {"errore": "HF_TOKEN non disponibile nel container dopo 5 tentativi"}
+        # Leggi HF_TOKEN una sola volta
+        HF_TOKEN = os.environ.get("HF_TOKEN")
+        
+        if not HF_TOKEN:
+            return {"errore": "HF_TOKEN non configurato. Verifica le variabili di ambiente in Railway."}
 
         url = "https://api-inference.huggingface.co/models/mistralai/Mixtral-8x7B-Instruct-v0.1"
 
@@ -228,10 +223,8 @@ def stop_job(clean_intermedi: bool = False):
 def home():
     return {"status": "ok", "message": "music-analyzer attivo"}
 
-@app.get("/")
-def home():
-    return {"status": "ok", "message": "music-analyzer attivo"}
 
 @app.get("/check-env")
 def check_env():
-    return {"HF_TOKEN": os.environ.get("HF_TOKEN")}
+    return {"HF_TOKEN": "presente" if os.environ.get("HF_TOKEN") else "non configurato"}
+
