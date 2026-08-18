@@ -10,20 +10,41 @@ from fastapi.responses import FileResponse
 app = FastAPI()
 
 # ---------------------------
-# FUNZIONE AI CORRETTA + RETRY HF_TOKEN
+# CACHE GLOBALE HF_TOKEN
+# ---------------------------
+HF_TOKEN_CACHE = None
+
+
+@app.on_event("startup")
+async def startup_event():
+    global HF_TOKEN_CACHE
+
+    print("[startup] Avvio applicazione: verifica HF_TOKEN in corso...", flush=True)
+
+    for attempt in range(1, 6):
+        token = os.environ.get("HF_TOKEN")
+        if token:
+            HF_TOKEN_CACHE = token
+            print(f"[startup] HF_TOKEN trovato al tentativo {attempt}: caricato in cache.", flush=True)
+            break
+        print(f"[startup] Tentativo {attempt}/5: HF_TOKEN non ancora disponibile, attendo 1 secondo...", flush=True)
+        time.sleep(1)
+
+    if HF_TOKEN_CACHE is None:
+        print("[startup] ATTENZIONE: HF_TOKEN NON disponibile dopo 5 tentativi.", flush=True)
+    else:
+        print("[startup] HF_TOKEN presente e caricato correttamente.", flush=True)
+
+
+# ---------------------------
+# FUNZIONE AI CORRETTA (USA CACHE HF_TOKEN)
 # ---------------------------
 def call_ai_service(titolo, autore):
     try:
-        # Retry automatico per HF_TOKEN
-        HF_TOKEN = None
-        for _ in range(5):
-            HF_TOKEN = os.environ.get("HF_TOKEN")
-            if HF_TOKEN:
-                break
-            time.sleep(1)
+        if HF_TOKEN_CACHE is None:
+            return {"errore": "HF_TOKEN non disponibile nel container"}
 
-        if HF_TOKEN is None:
-            return {"errore": "HF_TOKEN non disponibile nel container dopo 5 tentativi"}
+        HF_TOKEN = HF_TOKEN_CACHE
 
         url = "https://api-inference.huggingface.co/models/mistralai/Mixtral-8x7B-Instruct-v0.1"
 
@@ -33,6 +54,7 @@ def call_ai_service(titolo, autore):
         }
 
         prompt = f"""
+
 Sei un esperto mondiale di musica, rarità, collezionismo e mercato dei dischi.
 Analizza questo disco e restituisci SOLO un JSON con queste chiavi:
 
@@ -226,12 +248,15 @@ def stop_job(clean_intermedi: bool = False):
 
 @app.get("/")
 def home():
-    return {"status": "ok", "message": "music-analyzer attivo"}
+    return {
+        "status": "ok",
+        "message": "music-analyzer attivo",
+        "hf_token_loaded": HF_TOKEN_CACHE is not None
+    }
 
-@app.get("/")
-def home():
-    return {"status": "ok", "message": "music-analyzer attivo"}
 
 @app.get("/check-env")
 def check_env():
-    return {"HF_TOKEN": os.environ.get("HF_TOKEN")}
+    return {
+        "HF_TOKEN": "presente e caricato" if HF_TOKEN_CACHE is not None else "NON disponibile"
+    }
